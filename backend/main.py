@@ -11,10 +11,16 @@ import time
 import logging
 import sqlite3
 import hashlib
+import base64
 from datetime import datetime, timedelta
 from typing import Optional, List
 from contextlib import asynccontextmanager
 from collections import defaultdict
+
+from Crypto.Cipher import AES
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP
+from Crypto.Random import get_random_bytes
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -264,6 +270,7 @@ class PredictionResponse(BaseModel):
     shap_explanation: dict
     scan_id: Optional[int] = None
     source: Optional[str] = None
+    integrity_hash: Optional[str] = None
 
 
 class ReportInput(BaseModel):
@@ -282,6 +289,25 @@ class HistoryResponse(BaseModel):
     risk_level: str
     phishing_probability: float
     scanned_at: str
+
+
+class EncryptRequest(BaseModel):
+    """Input for AES encryption endpoint."""
+    data: dict = Field(..., description="JSON data to encrypt")
+
+
+class DecryptRequest(BaseModel):
+    """Input for AES decryption endpoint."""
+    ciphertext: str = Field(..., description="Base64-encoded ciphertext")
+    key: str = Field(..., description="Base64-encoded AES-256 key")
+    nonce: str = Field(..., description="Base64-encoded nonce")
+    tag: str = Field(..., description="Base64-encoded authentication tag")
+
+
+class VerifyRequest(BaseModel):
+    """Input for SHA-256 integrity verification."""
+    data: dict = Field(..., description="Original data")
+    sha256_hash: str = Field(..., description="SHA-256 hash to verify against")
 
 
 # ===================== Middleware =====================
@@ -446,7 +472,15 @@ async def predict_url(input_data: URLInput, request: Request):
     # Remove raw features from response (too large)
     result.pop('features', None)
     result['source'] = 'model'
-    
+
+    # SHA-256 integrity hash of the prediction result
+    result_bytes = json.dumps({
+        'url': result['url'],
+        'prediction': result['prediction'],
+        'confidence': result['confidence'],
+    }, sort_keys=True).encode()
+    result['integrity_hash'] = hashlib.sha256(result_bytes).hexdigest()
+
     return PredictionResponse(**result)
 
 
@@ -742,6 +776,196 @@ async def add_to_whitelist(domain: str):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+
+# ===================== Header Inspection Endpoint =====================
+
+@app.get("/headers", tags=["Security"])
+async def inspect_headers(url: str):
+    """
+    Fetch and analyze HTTP response headers of a URL.
+
+    - Detects missing security headers (HSTS, CSP, X-Frame-Options, etc.)
+    - Counts redirects and shows final destination URL
+    - Flags each missing header as a security risk
+    """
+    import requests as req
+    if not url.startswith(('http://', 'https://')):
+        url = 'http://' + url
+    try:
+        r = req.head(url, timeout=6, allow_redirects=True)
+        headers = dict(r.headers)
+
+        security_checks = {
+            'Strict-Transport-Security': 'HSTS — forces HTTPS, prevents downgrade attacks',
+            'Content-Security-Policy': 'CSP — prevents XSS and data injection attacks',
+            'X-Frame-Options': 'Clickjacking protection',
+            'X-Content-Type-Options': 'Prevents MIME-type sniffing',
+            'Referrer-Policy': 'Controls referrer information leakage',
+            'Permissions-Policy': 'Restricts browser feature access',
+        }
+
+        present, missing = [], []
+        for header, description in security_checks.items():
+            if header in headers:
+                present.append({'header': header, 'value': headers[header], 'description': description})
+            else:
+                missing.append({'header': header, 'description': description, 'risk': 'Security header absent'})
+
+        redirect_chain = [str(resp.url) for resp in r.history]
+
+        logger.info(f"Header inspection for {url} — {len(missing)} missing security headers")
+        return {
+            'url': url,
+            'final_url': str(r.url),
+            'status_code': r.status_code,
+            'redirect_count': len(r.history),
+            'redirect_chain': redirect_chain,
+            'security_score': f"{len(present)}/{len(security_checks)}",
+            'present_headers': present,
+            'missing_headers': missing,
+            'all_headers': headers,
+        }
+    except req.exceptions.Timeout:
+        raise HTTPException(status_code=408, detail="Request timed out — URL may be unreachable.")
+    except req.exceptions.ConnectionError:
+        raise HTTPException(status_code=502, detail="Could not connect to the URL.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Header inspection failed: {str(e)}")
+
+
+# ===================== Cryptography Endpoints =====================
+
+@app.post("/crypto/encrypt", tags=["Cryptography"])
+async def encrypt_data(req: EncryptRequest):
+    """
+    Encrypt JSON data using AES-256-EAX (symmetric encryption).
+
+    - Generates a fresh AES-256 key and nonce per request.
+    - Returns ciphertext, key, nonce, and authentication tag (all Base64).
+    - Use /crypto/decrypt with the returned key to recover the original data.
+    """
+    try:
+        plaintext = json.dumps(req.data).encode()
+        key = get_random_bytes(32)          # AES-256
+        cipher = AES.new(key, AES.MODE_EAX)
+        ciphertext, tag = cipher.encrypt_and_digest(plaintext)
+
+        # SHA-256 integrity hash of the plaintext
+        integrity_hash = hashlib.sha256(plaintext).hexdigest()
+
+        logger.info("AES-256 encryption performed.")
+        return {
+            "algorithm": "AES-256-EAX",
+            "ciphertext": base64.b64encode(ciphertext).decode(),
+            "key": base64.b64encode(key).decode(),
+            "nonce": base64.b64encode(cipher.nonce).decode(),
+            "tag": base64.b64encode(tag).decode(),
+            "sha256_integrity_hash": integrity_hash,
+            "note": "Store the key securely. Use /crypto/decrypt to recover data. Use /crypto/verify to check integrity.",
+        }
+    except Exception as e:
+        logger.error(f"Encryption error: {e}")
+        raise HTTPException(status_code=500, detail=f"Encryption failed: {str(e)}")
+
+
+@app.post("/crypto/decrypt", tags=["Cryptography"])
+async def decrypt_data(req: DecryptRequest):
+    """
+    Decrypt AES-256-EAX ciphertext back to original JSON.
+
+    - Verifies the authentication tag automatically (tamper detection).
+    - Returns the decrypted data and its SHA-256 hash for integrity confirmation.
+    """
+    try:
+        key = base64.b64decode(req.key)
+        nonce = base64.b64decode(req.nonce)
+        tag = base64.b64decode(req.tag)
+        ciphertext = base64.b64decode(req.ciphertext)
+
+        cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
+        plaintext = cipher.decrypt_and_verify(ciphertext, tag)  # raises ValueError if tampered
+
+        decrypted_data = json.loads(plaintext.decode())
+        integrity_hash = hashlib.sha256(plaintext).hexdigest()
+
+        logger.info("AES-256 decryption successful — integrity verified.")
+        return {
+            "status": "success",
+            "decrypted_data": decrypted_data,
+            "sha256_integrity_hash": integrity_hash,
+            "integrity": "verified",
+        }
+    except ValueError:
+        logger.warning("Decryption failed — data may have been tampered with.")
+        raise HTTPException(status_code=400, detail="Decryption failed: authentication tag mismatch. Data may be tampered.")
+    except Exception as e:
+        logger.error(f"Decryption error: {e}")
+        raise HTTPException(status_code=500, detail=f"Decryption failed: {str(e)}")
+
+
+@app.post("/crypto/verify", tags=["Cryptography"])
+async def verify_integrity(req: VerifyRequest):
+    """
+    Verify SHA-256 integrity hash of a scan result.
+
+    - Recomputes SHA-256 of the provided data.
+    - Compares against the supplied hash to detect tampering.
+    - Use the sha256_integrity_hash returned by /crypto/encrypt or /predict.
+    """
+    plaintext = json.dumps(req.data, sort_keys=True).encode()
+    computed = hashlib.sha256(plaintext).hexdigest()
+    match = computed == req.sha256_hash
+
+    logger.info(f"Integrity check: {'PASS' if match else 'FAIL'}")
+    return {
+        "match": match,
+        "status": "intact" if match else "tampered",
+        "provided_hash": req.sha256_hash,
+        "computed_hash": computed,
+        "algorithm": "SHA-256",
+    }
+
+
+@app.get("/crypto/rsa-demo", tags=["Cryptography"])
+async def rsa_demo():
+    """
+    RSA-2048 key generation and encryption demo.
+
+    - Generates a fresh RSA-2048 key pair.
+    - Encrypts a sample message using the public key (PKCS1-OAEP).
+    - Decrypts it using the private key to prove the round-trip.
+    - Demonstrates asymmetric encryption concept used in HTTPS/TLS.
+    """
+    try:
+        # Generate RSA-2048 key pair
+        key = RSA.generate(2048)
+        private_key = key
+        public_key = key.publickey()
+
+        # Encrypt a sample payload with public key
+        sample_message = b"SecureSurf AI - RSA asymmetric encryption demo"
+        cipher_rsa = PKCS1_OAEP.new(public_key)
+        encrypted = cipher_rsa.encrypt(sample_message)
+
+        # Decrypt with private key
+        decipher_rsa = PKCS1_OAEP.new(private_key)
+        decrypted = decipher_rsa.decrypt(encrypted)
+
+        logger.info("RSA-2048 demo completed.")
+        return {
+            "algorithm": "RSA-2048 with PKCS1-OAEP",
+            "key_size_bits": 2048,
+            "original_message": sample_message.decode(),
+            "encrypted_preview": base64.b64encode(encrypted).decode()[:64] + "...",
+            "decrypted_message": decrypted.decode(),
+            "round_trip_success": decrypted == sample_message,
+            "public_key_preview": public_key.export_key().decode()[:120] + "...",
+            "use_case": "Asymmetric encryption — public key encrypts, private key decrypts. Used in HTTPS/TLS handshake.",
+        }
+    except Exception as e:
+        logger.error(f"RSA demo error: {e}")
+        raise HTTPException(status_code=500, detail=f"RSA demo failed: {str(e)}")
 
 
 # ===================== Helper Functions =====================
